@@ -1,0 +1,89 @@
+package com.ttu.pay.utils
+
+import com.ttu.pay.articles.core.{ArticleSlug, ArticlesRepository}
+import com.ttu.pay.auth.AuthService
+import com.ttu.pay.common.{CustomDecodeFailureHandler, DefectHandler}
+import com.ttu.pay.db.{Db, DbConfig, DbMigrator}
+import com.ttu.pay.users.UsersRepository
+import com.ttu.pay.utils.DbData.exampleUser1
+import io.getquill.*
+import io.getquill.jdbczio.*
+import sttp.client3.SttpBackend
+import sttp.client3.testing.SttpBackendStub
+import sttp.tapir.server.stub.TapirStubInterpreter
+import sttp.tapir.server.ziohttp.ZioHttpServerOptions
+import sttp.tapir.ztapir.{RIOMonadError, ZServerEndpoint}
+import zio.{RIO, Random, ZIO, ZLayer}
+
+import java.nio.file.{Files, Paths}
+import javax.sql.DataSource
+
+object TestUtils:
+
+  def zioTapirStubInterpreter: TapirStubInterpreter[[_$1] =>> RIO[Any, _$1], Nothing, ZioHttpServerOptions[Any]] =
+    TapirStubInterpreter(
+      ZioHttpServerOptions.customiseInterceptors
+        .exceptionHandler(new DefectHandler())
+        .decodeFailureHandler(CustomDecodeFailureHandler.create()),
+      SttpBackendStub(new RIOMonadError[Any])
+    )
+
+  def backendStub(endpoint: ZServerEndpoint[Any, Any]): SttpBackend[[_$1] =>> RIO[Any, _$1], Nothing] =
+    zioTapirStubInterpreter
+      .whenServerEndpoint(endpoint)
+      .thenRunLogic()
+      .backend()
+
+  type TestDbLayer = DbConfig & DataSource & DbMigrator & Quill.Sqlite[SnakeCase]
+
+  def getValidTokenAuthenticationHeader(email: String = exampleUser1.email): RIO[AuthService, Map[String, String]] =
+    for {
+      authService <- ZIO.service[AuthService]
+      jwt <- authService.generateJwt(email)
+    } yield Map("Authorization" -> s"Token $jwt")
+
+  def getValidBearerAuthorizationHeader(email: String = exampleUser1.email): RIO[AuthService, Map[String, String]] =
+    for {
+      authService <- ZIO.service[AuthService]
+      jwt <- authService.generateJwt(email)
+    } yield Map("Authorization" -> s"Bearer $jwt")
+
+  private def clearDb(cfg: DbConfig): RIO[Any, Unit] = for {
+    dbPath <- ZIO.succeed(
+      Paths.get(cfg.jdbcUrl.replace("jdbc:sqlite:", ""))
+    )
+    _ <- ZIO.attemptBlocking(
+      Files.deleteIfExists(dbPath)
+    )
+  } yield ()
+
+  private val initializeDb: RIO[DbMigrator, Unit] = for {
+    migrator <- ZIO.service[DbMigrator]
+    _ <- migrator.migrate()
+  } yield ()
+
+  private val createTestDbConfig: ZIO[Any, Nothing, DbConfig] = for {
+    uuid <- Random.RandomLive.nextUUID
+    tmpDir <- zio.System.SystemLive.propertyOrElse("java.io.tmpdir", ".").orDie
+  } yield DbConfig(s"jdbc:sqlite:$tmpDir/realworld-test-$uuid.sqlite")
+
+  private val testDbConfigLive: ZLayer[Any, Nothing, DbConfig] =
+    ZLayer.scoped {
+      ZIO.acquireRelease(acquire = createTestDbConfig)(release = config => clearDb(config).orDie)
+    }
+
+  val testDbLayer: ZLayer[Any, Nothing, TestDbLayer] =
+    testDbConfigLive >+> Db.dataSourceLive >+> Db.quillLive >+> DbMigrator.live
+
+  val testDbLayerWithEmptyDb: ZLayer[Any, Nothing, TestDbLayer] =
+    testDbLayer >+> ZLayer.fromZIO(initializeDb.orDie)
+
+  def findUserIdByEmail(userRepo: UsersRepository, email: String): ZIO[Any, Serializable, Int] =
+    userRepo
+      .findUserIdByEmail(email)
+      .someOrFail(s"User with email $email doesn't exist.")
+
+  def findArticleIdBySlug(articleRepo: ArticlesRepository, slug: ArticleSlug): ZIO[Any, Serializable, Int] =
+    articleRepo
+      .findArticleIdBySlug(slug)
+      .someOrFail(s"Article ${slug.value} doesn't exist")
